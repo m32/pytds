@@ -1538,6 +1538,18 @@ class _TdsSession(object):
         self.ret_status = self._reader.get_int()
         self.has_status = True
 
+    def process_tabname(self):
+        r = self._reader
+        total_length = r.get_smallint()
+        if not tds_base.IS_TDS71_PLUS(self):
+            name_length = r.get_smallint()
+        skipall(r, total_length)
+
+    def process_colinfo(self):
+        r = self._reader
+        total_length = r.get_smallint()
+        skipall(r, total_length)
+
     def process_token(self, marker):
         handler = _token_map.get(marker)
         if not handler:
@@ -1665,6 +1677,9 @@ _token_map = {
     tds_base.TDS_ORDERBY2_TOKEN: lambda self: self.process_orderby2(),
     tds_base.TDS_ORDERBY_TOKEN: lambda self: self.process_orderby(),
     tds_base.TDS_RETURNSTATUS_TOKEN: lambda self: self.process_returnstatus(),
+
+    tds_base.TDS_TABNAME_TOKEN: lambda self: self.process_tabname(),
+    tds_base.TDS_COLINFO_TOKEN: lambda self: self.process_colinfo(),
     }
 
 
