@@ -286,6 +286,11 @@ class Connection(object):
                     last_error = LoginError("Cannot connect to server '{0}': {1}".format(host, e), e)
                 else:
                     sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+
+                    # default keep alive should be 30 seconds according to spec:
+                    # https://msdn.microsoft.com/en-us/library/dd341108.aspx
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 30)
+
                     sock.settimeout(retry_time)
                     conn = _TdsSocket(self._use_tz)
                     try:
@@ -806,7 +811,7 @@ class Cursor(six.Iterator):
 
     def copy_to(self, file, table_or_view, sep='\t', columns=None,
                 check_constraints=False, fire_triggers=False, keep_nulls=False,
-                kb_per_batch=None, rows_per_batch=None, order=None, tablock=False):
+                kb_per_batch=None, rows_per_batch=None, order=None, tablock=False, schema=None):
         """ *Experimental*. Efficiently load data to database from file using ``BULK INSERT`` operation
 
         :param file: Source file-like object, should be in csv format
@@ -838,14 +843,20 @@ class Cursor(six.Iterator):
           Can be used to optimize performance, see MSSQL server documentation for details
         :type order: list
         :keyword tablock: Enable or disable table lock for the duration of bulk load
+        :keyword schema: Name of schema for table or view, if not specified default schema will be used
         """
         conn = self._conn()
         import csv
         reader = csv.reader(file, delimiter=sep)
-        if not columns:
-            self.execute('select top 1 * from [{}] where 1<>1'.format(table_or_view))
-            columns = [col[0] for col in self.description]
-        metadata = [Column(name=col, type=NVarCharType(size=4000), flags=Column.fNullable) for col in columns]
+        obj_name = tds_base.tds_quote_id(table_or_view)
+        if schema:
+            obj_name = '{0}.{1}'.format(tds_base.tds_quote_id(schema), obj_name)
+        if columns:
+            metadata = [Column(name=name, type=NVarCharType(size=4000), flags=Column.fNullable) for name in columns]
+        else:
+            self.execute('select top 1 * from {} where 1<>1'.format(obj_name))
+            metadata = [Column(name=col[0], type=NVarCharType(size=4000), flags=Column.fNullable if col[6] else 0)
+                        for col in self.description]
         col_defs = ','.join('{0} {1}'.format(col.column_name, col.type.get_declaration())
                             for col in metadata)
         with_opts = []
@@ -866,7 +877,7 @@ class Cursor(six.Iterator):
         with_part = ''
         if with_opts:
             with_part = 'WITH ({0})'.format(','.join(with_opts))
-        operation = 'INSERT BULK [{0}]({1}) {2}'.format(table_or_view, col_defs, with_part)
+        operation = 'INSERT BULK {0}({1}) {2}'.format(obj_name, col_defs, with_part)
         self.execute(operation)
         self._session.submit_bulk(metadata, reader)
         self._session.process_simple_request()
