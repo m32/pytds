@@ -4,11 +4,17 @@ pytds
 .. image:: https://secure.travis-ci.org/denisenkom/pytds.png?branch=master
    :target: https://travis-ci.org/denisenkom/pytds
 
+.. image:: https://ci.appveyor.com/api/projects/status/a5h4y29063crqtet?svg=true
+   :target: https://ci.appveyor.com/project/denisenkom/pytds
+
 .. image:: http://img.shields.io/pypi/dm/python-tds.svg
    :target: https://pypi.python.org/pypi/python-tds/
 
 .. image:: http://img.shields.io/pypi/v/python-tds.svg
    :target: https://pypi.python.org/pypi/python-tds/
+
+.. image:: https://codecov.io/gh/denisenkom/pytds/branch/master/graph/badge.svg
+  :target: https://codecov.io/gh/denisenkom/pytds
 
 
 `Python DBAPI`_ driver for MSSQL using pure Python TDS (Tabular Data Stream) protocol implementation.
