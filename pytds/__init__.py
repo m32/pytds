@@ -115,10 +115,13 @@ def recordtype_row_strategy(column_names):
     Column names that are not valid Python identifiers will be replaced
     with col<number>_
     """
-    import recordtype  # optional dependency
+    try:
+        from namedlist import namedlist as recordtype  # optional dependency
+    except ImportError:
+        from recordtype import recordtype  # optional dependency
     # replace empty column names with placeholders
     column_names = [name if is_valid_identifier(name) else 'col%s_' % idx for idx, name in enumerate(column_names)]
-    recordtype_row_class = recordtype.recordtype('Row', column_names)
+    recordtype_row_class = recordtype('Row', column_names)
 
     # custom extension class that supports indexing
     class Row(recordtype_row_class):
@@ -811,7 +814,8 @@ class Cursor(six.Iterator):
 
     def copy_to(self, file, table_or_view, sep='\t', columns=None,
                 check_constraints=False, fire_triggers=False, keep_nulls=False,
-                kb_per_batch=None, rows_per_batch=None, order=None, tablock=False, schema=None):
+                kb_per_batch=None, rows_per_batch=None, order=None, tablock=False,
+                schema=None, null_string=None):
         """ *Experimental*. Efficiently load data to database from file using ``BULK INSERT`` operation
 
         :param file: Source file-like object, should be in csv format
@@ -844,10 +848,19 @@ class Cursor(six.Iterator):
         :type order: list
         :keyword tablock: Enable or disable table lock for the duration of bulk load
         :keyword schema: Name of schema for table or view, if not specified default schema will be used
+        :keyword null_string: String that should be interpreted as a NULL when reading the CSV file.
         """
         conn = self._conn()
         import csv
         reader = csv.reader(file, delimiter=sep)
+
+        if null_string is not None:
+            def _convert_null_strings(csv_reader):
+                for row in csv_reader:
+                    yield [r if r != null_string else None for r in row]
+
+            reader = _convert_null_strings(reader)
+
         obj_name = tds_base.tds_quote_id(table_or_view)
         if schema:
             obj_name = '{0}.{1}'.format(tds_base.tds_quote_id(schema), obj_name)

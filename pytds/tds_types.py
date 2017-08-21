@@ -637,8 +637,10 @@ class VarChar70Serializer(BaseTypeSerializer):
         if val is None:
             w.put_smallint(-1)
         else:
-            val = tds_base.force_unicode(val)
-            val, _ = self._codec.encode(val)
+            if w._tds._tds._login.bytes_to_unicode:
+                val = tds_base.force_unicode(val)
+            if isinstance(val, six.text_type):
+                val, _ = self._codec.encode(val)
             w.put_smallint(len(val))
             w.write(val)
 
@@ -646,7 +648,10 @@ class VarChar70Serializer(BaseTypeSerializer):
         size = r.get_smallint()
         if size < 0:
             return None
-        return r.read_str(size, self._codec)
+        if r._session._tds._login.bytes_to_unicode:
+            return r.read_str(size, self._codec)
+        else:
+            return tds_base.readall(r, size)
 
 
 class VarChar71Serializer(VarChar70Serializer):
@@ -683,8 +688,10 @@ class VarCharMaxSerializer(VarChar72Serializer):
         if val is None:
             w.put_uint8(tds_base.PLP_NULL)
         else:
-            val = tds_base.force_unicode(val)
-            val, _ = self._codec.encode(val)
+            if w._tds._tds._login.bytes_to_unicode:
+                val = tds_base.force_unicode(val)
+            if isinstance(val, six.text_type):
+                val, _ = self._codec.encode(val)
             w.put_int8(len(val))
             if len(val) > 0:
                 w.put_int(len(val))
@@ -692,10 +699,14 @@ class VarCharMaxSerializer(VarChar72Serializer):
             w.put_int(0)
 
     def read(self, r):
+        login = r._session._tds._login
         r = PlpReader(r)
         if r.is_null():
             return None
-        return ''.join(tds_base.iterdecode(r.chunks(), self._codec))
+        if login.bytes_to_unicode:
+            return ''.join(tds_base.iterdecode(r.chunks(), self._codec))
+        else:
+            return six.b('').join(r.chunks())
 
 
 class NVarChar70Serializer(BaseTypeSerializer):
@@ -854,8 +865,10 @@ class Text70Serializer(BaseTypeSerializer):
         if val is None:
             w.put_int(-1)
         else:
-            val = tds_base.force_unicode(val)
-            val, _ = self._codec.encode(val)
+            if w._tds._tds._login.bytes_to_unicode:
+                val = tds_base.force_unicode(val)
+            if isinstance(val, six.text_type):
+                val, _ = self._codec.encode(val)
             w.put_int(len(val))
             w.write(val)
 
@@ -866,7 +879,10 @@ class Text70Serializer(BaseTypeSerializer):
         tds_base.readall(r, size)  # textptr
         tds_base.readall(r, 8)  # timestamp
         colsize = r.get_int()
-        return r.read_str(colsize, self._codec)
+        if r._session._tds._login.bytes_to_unicode:
+            return r.read_str(colsize, self._codec)
+        else:
+            return tds_base.readall(r, colsize)
 
 
 class Text71Serializer(Text70Serializer):
@@ -1062,6 +1078,54 @@ class VarBinarySerializerMax(VarBinarySerializer):
             return None
         return b''.join(r.chunks())
 
+class UDT72Serializer(BaseTypeSerializer):
+    # Data type definition stream used for UDT_INFO in TYPE_INFO
+    # https://msdn.microsoft.com/en-us/library/a57df60e-d0a6-4e7e-a2e5-ccacd277c673/
+    def __init__(self, max_byte_size, db_name, schema_name, type_name,
+                 assembly_qualified_name):
+        self.max_byte_size = max_byte_size
+        self.db_name = db_name
+        self.schema_name = schema_name
+        self.type_name = type_name
+        self.assembly_qualified_name = assembly_qualified_name
+        super(UDT72Serializer, self).__init__()
+
+    def __repr__(self):
+        return ('UDT72Serializer(max_byte_size={}, db_name={}, '
+                'schema_name={}, type_name={}, '
+                'assembly_qualified_name={})'.format(
+                    *map(repr, (
+                        self.max_byte_size, self.db_name, self.schema_name,
+                        self.type_name, self.assembly_qualified_name)))
+        )
+
+    @classmethod
+    def from_stream(cls, r):
+        # MAX_BYTE_SIZE
+        max_byte_size = r.get_usmallint()
+        assert max_byte_size == 0xffff or 1 < max_byte_size < 8000
+        # DB_NAME -- B_VARCHAR
+        db_name = r.read_ucs2(r.get_byte())
+        # SCHEMA_NAME -- B_VARCHAR
+        schema_name = r.read_ucs2(r.get_byte())
+        # TYPE_NAME -- B_VARCHAR
+        type_name = r.read_ucs2(r.get_byte())
+        # UDT_METADATA --
+        # a US_VARCHAR (2 bytes length prefix)
+        # containing ASSEMBLY_QUALIFIED_NAME
+        assembly_qualified_name = r.read_ucs2(r.get_smallint())
+        return cls(max_byte_size, db_name, schema_name, type_name,
+                   assembly_qualified_name)
+
+    def read(self, r):
+        r = PlpReader(r)
+        if r.is_null():
+            return None
+        return b''.join(r.chunks())
+
+class UDT72SerializerMax(UDT72Serializer):
+    def __init__(self, *args, **kwargs):
+        super(UDT72SerializerMax, self).__init__(0, *args, **kwargs)
 
 class Image70Serializer(BaseTypeSerializer):
     type = tds_base.SYBIMAGE
@@ -2196,6 +2260,7 @@ _type_map72.update({
     tds_base.XSYBBINARY: VarBinarySerializer72,
     tds_base.XSYBVARBINARY: VarBinarySerializer72,
     tds_base.SYBIMAGE: Image72Serializer,
+    tds_base.UDTTYPE: UDT72Serializer,
 })
 
 _type_map73 = _type_map72.copy()
