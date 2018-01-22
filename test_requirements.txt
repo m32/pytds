@@ -1,3 +1,7 @@
 pytest
 pytest-cov
 codecov
+pyOpenSSL
+pyDes
+ntlm-auth
+namedlist
