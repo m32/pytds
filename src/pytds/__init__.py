@@ -685,10 +685,10 @@ class Cursor(six.Iterator):
                     [self._session.make_param('', operation), self._session.make_param('', param_definition)] + named_params,
                     0))
             else:
-                operation = operation % {}
+                operation = operation.replace('%%', '%')
                 self._exec_with_retry(lambda: self._session.submit_plain_query(operation))
         else:
-            operation = operation % {}
+            operation = operation.replace('%%', '%')
             self._exec_with_retry(lambda: self._session.submit_plain_query(operation))
         self._session.find_result_or_done()
         self._setup_row_factory()
