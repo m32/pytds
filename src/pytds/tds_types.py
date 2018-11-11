@@ -107,7 +107,10 @@ class _DefaultChunkedHandler(object):
         self.stream.write(val)
 
     def end(self):
-        return self.stream.getvalue()
+        value = self.stream.getvalue()
+        self.stream.seek(0)
+        self.stream.truncate()
+        return value
 
     def __eq__(self, other):
         return self.stream.getvalue() == other.stream.getvalue()
@@ -250,15 +253,17 @@ class DecimalType(SqlTypeMetaclass):
     def from_value(cls, value):
         if not (-10 ** 38 + 1 <= value <= 10 ** 38 - 1):
             raise tds_base.DataError('Decimal value is out of range')
-        value = value.normalize()
-        _, digits, exp = value.as_tuple()
-        if exp > 0:
-            scale = 0
-            prec = len(digits) + exp
-        else:
-            scale = -exp
-            prec = max(len(digits), scale)
-        return cls(precision=prec, scale=scale)
+        with decimal.localcontext() as context:
+            context.prec = 38
+            value = value.normalize()
+            _, digits, exp = value.as_tuple()
+            if exp > 0:
+                scale = 0
+                prec = len(digits) + exp
+            else:
+                scale = -exp
+                prec = max(len(digits), scale)
+            return cls(precision=prec, scale=scale)
 
     @property
     def precision(self):
@@ -726,11 +731,23 @@ class VarCharMaxSerializer(VarChar72Serializer):
                 val = tds_base.force_unicode(val)
             if isinstance(val, six.text_type):
                 val, _ = self._codec.encode(val)
-            w.put_int8(len(val))
+
+            # Putting the actual length here causes an error when bulk inserting:
+            #
+            # While reading current row from host, a premature end-of-message
+            # was encountered--an incoming data stream was interrupted when
+            # the server expected to see more data. The host program may have
+            # terminated. Ensure that you are using a supported client
+            # application programming interface (API).
+            #
+            # See https://github.com/tediousjs/tedious/issues/197
+            # It is not known why this happens, but Microsoft's bcp tool
+            # uses PLP_UNKNOWN for varchar(max) as well.
+            w.put_uint8(tds_base.PLP_UNKNOWN)
             if len(val) > 0:
-                w.put_int(len(val))
+                w.put_uint(len(val))
                 w.write(val)
-            w.put_int(0)
+            w.put_uint(0)
 
     def read(self, r):
         login = r._session._tds._login
@@ -831,7 +848,19 @@ class NVarCharMaxSerializer(NVarChar72Serializer):
             if isinstance(val, bytes):
                 val = tds_base.force_unicode(val)
             val, _ = ucs2_codec.encode(val)
-            w.put_uint8(len(val))
+
+            # Putting the actual length here causes an error when bulk inserting:
+            #
+            # While reading current row from host, a premature end-of-message
+            # was encountered--an incoming data stream was interrupted when
+            # the server expected to see more data. The host program may have
+            # terminated. Ensure that you are using a supported client
+            # application programming interface (API).
+            #
+            # See https://github.com/tediousjs/tedious/issues/197
+            # It is not known why this happens, but Microsoft's bcp tool
+            # uses PLP_UNKNOWN for nvarchar(max) as well.
+            w.put_uint8(tds_base.PLP_UNKNOWN)
             if len(val) > 0:
                 w.put_uint(len(val))
                 w.write(val)
@@ -1858,28 +1887,28 @@ class MsDecimalSerializer(BaseTypeSerializer):
         w.pack(self._info_struct, self.size, self.precision, self.scale)
 
     def write(self, w, value):
-        if value is None:
-            w.put_byte(0)
-            return
-        if not isinstance(value, decimal.Decimal):
-            value = decimal.Decimal(value)
-        value = value.normalize()
-        scale = self.scale
-        size = self.size
-        w.put_byte(size)
-        val = value
-        positive = 1 if val > 0 else 0
-        w.put_byte(positive)  # sign
-        with decimal.localcontext() as ctx:
-            ctx.prec = 38
+        with decimal.localcontext() as context:
+            context.prec = 38
+            if value is None:
+                w.put_byte(0)
+                return
+            if not isinstance(value, decimal.Decimal):
+                value = decimal.Decimal(value)
+            value = value.normalize()
+            scale = self.scale
+            size = self.size
+            w.put_byte(size)
+            val = value
+            positive = 1 if val > 0 else 0
+            w.put_byte(positive)  # sign
             if not positive:
                 val *= -1
             size -= 1
             val *= 10 ** scale
-        for i in range(size):
-            w.put_byte(int(val % 256))
-            val //= 256
-        assert val == 0
+            for i in range(size):
+                w.put_byte(int(val % 256))
+                val //= 256
+            assert val == 0
 
     def _decode(self, positive, buf):
         val = _decode_num(buf)
