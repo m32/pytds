@@ -18,7 +18,6 @@ from pytds.tds_types import NVarCharType
 from . import lcid
 import pytds.tz
 from .tds import (
-    SimpleLoadBalancer,
     _TdsSocket, tds7_get_instances,
     _create_exception_by_message,
     output, default
@@ -275,27 +274,8 @@ class Connection(object):
         """
         return self._conn.mars_enabled
 
-    def _try_open(self, timeout):
-        if self._pooling:
-            res = _connection_pool.take(self._key)
-            if res is not None:
-                self._conn, sess = res
-                if self._conn.mars_enabled:
-                    cursor = _MarsCursor(
-                        self,
-                        sess,
-                        self._tzinfo_factory)
-                else:
-                    cursor = Cursor(
-                        self,
-                        sess,
-                        self._tzinfo_factory)
-                self._active_cursor = self._main_cursor = cursor
-                cursor.callproc('sp_reset_connection')
-                return
-
+    def _connect(self, host, port, instance, timeout):
         login = self._login
-        host, port, instance = login.servers[0]
 
         try:
             login.server_name = host
@@ -320,7 +300,16 @@ class Connection(object):
         conn = _TdsSocket(self._use_tz)
         self._conn = conn
         try:
-            conn.login(login, sock, self._tzinfo_factory)
+            route = conn.login(login, sock, self._tzinfo_factory)
+            if route is not None:
+                # rerouted to different server
+                sock.close()
+                self._connect(host=route['server'],
+                              port=route['port'],
+                              instance=instance,
+                              timeout=timeout)
+                return
+
             if conn.mars_enabled:
                 cursor = _MarsCursor(
                     self,
@@ -339,6 +328,29 @@ class Connection(object):
         except:
             sock.close()
             raise
+
+    def _try_open(self, timeout):
+        if self._pooling:
+            res = _connection_pool.take(self._key)
+            if res is not None:
+                self._conn, sess = res
+                if self._conn.mars_enabled:
+                    cursor = _MarsCursor(
+                        self,
+                        sess,
+                        self._tzinfo_factory)
+                else:
+                    cursor = Cursor(
+                        self,
+                        sess,
+                        self._tzinfo_factory)
+                self._active_cursor = self._main_cursor = cursor
+                cursor.callproc('sp_reset_connection')
+                return
+
+        login = self._login
+        host, port, instance = login.servers[0]
+        self._connect(host=host, port=port, instance=instance, timeout=timeout)
 
     def _open(self):
         import time
@@ -546,6 +558,19 @@ class Cursor(six.Iterator):
         self._setup_row_factory()
         return results
 
+    def get_proc_outputs(self):
+        """
+        If stored procedure has result sets and OUTPUT parameters use this method
+        after you processed all result sets to get values of OUTPUT parameters.
+        :return: A list of output parameter values.
+        """
+
+        self._session.complete_rpc()
+        results = [None] * len(self._session.output_params.items())
+        for key, param in self._session.output_params.items():
+            results[key] = param.value
+        return results
+
     def callproc(self, procname, parameters=()):
         """
         Call a stored procedure with the given name.
@@ -554,6 +579,10 @@ class Cursor(six.Iterator):
         :type procname: str
         :keyword parameters: The optional parameters for the procedure
         :type parameters: sequence
+
+        Note: If stored procedure has OUTPUT parameters and result sets this
+        method will not return values for OUTPUT parameters, you should
+        call get_proc_outputs to get values for OUTPUT parameters.
         """
         conn = self._assert_open()
         conn._try_activate_cursor(self)
@@ -702,6 +731,8 @@ class Cursor(six.Iterator):
         conn = self._assert_open()
         conn._try_activate_cursor(self)
         self._execute(operation, params)
+        # for compatibility with pyodbc
+        return self
 
     def _begin_tran(self, isolation_level):
         conn = self._assert_open()
@@ -866,13 +897,14 @@ class Cursor(six.Iterator):
         """
         pass
 
-    def copy_to(self, file, table_or_view, sep='\t', columns=None,
+    def copy_to(self, file=None, table_or_view=None, sep='\t', columns=None,
                 check_constraints=False, fire_triggers=False, keep_nulls=False,
                 kb_per_batch=None, rows_per_batch=None, order=None, tablock=False,
-                schema=None, null_string=None):
+                schema=None, null_string=None, data=None):
         """ *Experimental*. Efficiently load data to database from file using ``BULK INSERT`` operation
 
-        :param file: Source file-like object, should be in csv format
+        :param file: Source file-like object, should be in csv format. Specify
+          either this or data, not both.
         :param table_or_view: Destination table or view in the database
         :type table_or_view: str
 
@@ -880,8 +912,17 @@ class Cursor(six.Iterator):
 
         :keyword sep: Separator used in csv file
         :type sep: str
-        :keyword columns: List of column names in target table to insert to,
-          if not provided will insert into all columns
+        :keyword columns: List of Column objects or column names in target
+          table to insert to. SQL Server will do some conversions, so these
+          may not have to match the actual table definition exactly.
+          If not provided will insert into all columns assuming nvarchar(4000)
+          NULL for all columns.
+          If only the column name is provided, the type is assumed to be
+          nvarchar(4000) NULL.
+          If rows are given with file, you cannot specify non-string data
+          types.
+          If rows are given with data, the values must be a type supported by
+          the serializer for the column in tds_types.
         :type columns: list
         :keyword check_constraints: Check table constraints for incoming data
         :type check_constraints: bool
@@ -902,29 +943,43 @@ class Cursor(six.Iterator):
         :type order: list
         :keyword tablock: Enable or disable table lock for the duration of bulk load
         :keyword schema: Name of schema for table or view, if not specified default schema will be used
-        :keyword null_string: String that should be interpreted as a NULL when reading the CSV file.
+        :keyword null_string: String that should be interpreted as a NULL when
+          reading the CSV file. Has no meaning if using data instead of file.
+        :keyword data: The data to insert as an iterable of rows, which are
+          iterables of values. Specify either this or file, not both.
         """
         conn = self._conn()
-        import csv
-        reader = csv.reader(file, delimiter=sep)
+        rows = None
+        if data is None:
+            import csv
+            reader = csv.reader(file, delimiter=sep)
 
-        if null_string is not None:
-            def _convert_null_strings(csv_reader):
-                for row in csv_reader:
-                    yield [r if r != null_string else None for r in row]
+            if null_string is not None:
+                def _convert_null_strings(csv_reader):
+                    for row in csv_reader:
+                        yield [r if r != null_string else None for r in row]
 
-            reader = _convert_null_strings(reader)
+                reader = _convert_null_strings(reader)
+
+            rows = reader
+        else:
+            rows = data
 
         obj_name = tds_base.tds_quote_id(table_or_view)
         if schema:
             obj_name = '{0}.{1}'.format(tds_base.tds_quote_id(schema), obj_name)
         if columns:
-            metadata = [Column(name=name, type=NVarCharType(size=4000), flags=Column.fNullable) for name in columns]
+            metadata = []
+            for column in columns:
+                if isinstance(column, Column):
+                    metadata.append(column)
+                else:
+                    metadata.append(Column(name=column, type=NVarCharType(size=4000), flags=Column.fNullable))
         else:
             self.execute('select top 1 * from {} where 1<>1'.format(obj_name))
             metadata = [Column(name=col[0], type=NVarCharType(size=4000), flags=Column.fNullable if col[6] else 0)
                         for col in self.description]
-        col_defs = ','.join('{0} {1}'.format(col.column_name, col.type.get_declaration())
+        col_defs = ','.join('{0} {1}'.format(tds_base.tds_quote_id(col.column_name), col.type.get_declaration())
                             for col in metadata)
         with_opts = []
         if check_constraints:
@@ -946,7 +1001,7 @@ class Cursor(six.Iterator):
             with_part = 'WITH ({0})'.format(','.join(with_opts))
         operation = 'INSERT BULK {0}({1}) {2}'.format(obj_name, col_defs, with_part)
         self.execute(operation)
-        self._session.submit_bulk(metadata, reader)
+        self._session.submit_bulk(metadata, rows)
         self._session.process_simple_request()
 
 
@@ -990,6 +1045,8 @@ class _MarsCursor(Cursor):
     def execute(self, operation, params=()):
         self._assert_open()
         self._execute(operation, params)
+        # for compatibility with pyodbc
+        return self
 
     def callproc(self, procname, parameters=()):
         """
@@ -1020,6 +1077,7 @@ class _MarsCursor(Cursor):
 
 def _resolve_instance_port(server, port, instance, timeout=5):
     if instance and not port:
+        logger.info('querying %s for list of instances', server)
         instances = tds7_get_instances(server, timeout=timeout)
         if instance not in instances:
             raise LoginError("Instance {0} not found on server {1}".format(instance, server))
@@ -1160,6 +1218,8 @@ def connect(dsn=None, database=None, user=None, password=None, timeout=None,
     login.language = ''  # use database default
     login.attach_db_file = ''
     login.tds_version = tds_version
+    if tds_version < tds_base.TDS70:
+        raise ValueError('This TDS version is not supported')
     login.database = database or ''
     login.bulk_copy = False
     login.client_lcid = lcid.LANGID_ENGLISH_US

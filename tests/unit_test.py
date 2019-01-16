@@ -5,8 +5,13 @@ import decimal
 import struct
 import unittest
 import uuid
-import pytest
+import socket
+import threading
+import logging
+import sys
+import os
 
+import pytest
 import OpenSSL.crypto
 
 import pytds
@@ -33,6 +38,7 @@ from pytds.tds_types import (
 import pytds.login
 
 tzoffset = pytds.tz.FixedOffsetTimezone
+logger = logging.getLogger(__name__)
 
 
 class _FakeSock(object):
@@ -146,6 +152,9 @@ class TestMessages(unittest.TestCase):
         ])
         tds = _TdsSocket()
         tds._main_session = _TdsSession(tds, sock, None)
+        # test repr on some objects
+        repr(tds._main_session)
+        repr(tds)
         tds.sock = sock
         login = _TdsLogin()
         login.enc_flag = PreLoginEnc.ENCRYPT_NOT_SUP
@@ -185,6 +194,30 @@ class TestMessages(unittest.TestCase):
         with self.assertRaises(pytds.InterfaceError):
             login = self._make_login()
             tds._main_session.process_prelogin(login)
+
+        # test bad size
+        with self.assertRaisesRegexp(pytds.InterfaceError, 'Invalid size of PRELOGIN structure'):
+            login = self._make_login()
+            tds._main_session.parse_prelogin(login=login, octets=b'\x01')
+
+    def make_tds(self):
+        tds = _TdsSocket()
+        sock = _FakeSock([])
+        tds._main_session = _TdsSession(tds, sock, None)
+        return tds
+
+    def test_prelogin_unexpected_encrypt_on(self):
+        tds = self.make_tds()
+        with self.assertRaisesRegexp(pytds.InterfaceError, 'Server returned unexpected ENCRYPT_ON value'):
+            login = self._make_login()
+            login.enc_flag = PreLoginEnc.ENCRYPT_ON
+            tds._main_session.parse_prelogin(login=login, octets=b'\x01\x00\x06\x00\x01\xff\x00')
+
+    def test_prelogin_unexpected_enc_flag(self):
+        tds = self.make_tds()
+        with self.assertRaisesRegexp(pytds.InterfaceError, 'Unexpected value of enc_flag returned by server: 5'):
+            login = self._make_login()
+            tds._main_session.parse_prelogin(login=login, octets=b'\x01\x00\x06\x00\x01\xff\x05')
 
     def test_prelogin_generation(self):
         sock = _FakeSock('')
@@ -443,7 +476,7 @@ class TestMessages(unittest.TestCase):
         w._pos = 0
         t.write(w, 'test')
         self.assertEqual(w._buf[:w._pos],
-                         b'\x08\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00t\x00e\x00s\x00t\x00\x00\x00\x00\x00')
+                         b'\xfe\xff\xff\xff\xff\xff\xff\xff\x08\x00\x00\x00t\x00e\x00s\x00t\x00\x00\x00\x00\x00')
 
     def test_get_instances(self):
         data = b'\x05[\x00ServerName;MISHA-PC;InstanceName;SQLEXPRESS;IsClustered;No;Version;10.0.1600.22;tcp;49849;;'
@@ -1035,15 +1068,26 @@ class MiscTestCase(unittest.TestCase):
         self.assertEqual(b'\x7f$-\x00\xff\x81\x8b\x01', DateTimeSerializer.encode(DateTime.MAX_PYDATETIME))
 
 
-class TestServer(object):
-    def __init__(self, address, enc, cert, key):
+class SimpleServer(object):
+    def __init__(self, address, enc=pytds.PreLoginEnc.ENCRYPT_NOT_SUP, cert=None, key=None, tds_version=pytds.tds_base.TDS74):
+        if os.environ.get('INAPPVEYOR', '') == '1':
+            pytest.skip("Appveyor does not allow server sockets even on localhost")
+        if sys.version_info[0:2] < (3, 6):
+            pytest.skip('only works on Python 3.6 and newer')
         import simple_server
         import threading
+        openssl_cert = None
+        openssl_key = None
+        if cert:
+            openssl_cert = OpenSSL.crypto.X509.from_cryptography(cert)
+        if key:
+            openssl_key = OpenSSL.crypto.PKey.from_cryptography_key(key)
         self._server = simple_server.SimpleServer(
             address,
             enc=enc,
-            cert=OpenSSL.crypto.X509.from_cryptography(cert),
-            pkey=OpenSSL.crypto.PKey.from_cryptography_key(key)
+            cert=openssl_cert,
+            pkey=openssl_key,
+            tds_version=tds_version,
         )
         self._server_thread = threading.Thread(target=lambda: self._server.serve_forever())
 
@@ -1058,23 +1102,11 @@ class TestServer(object):
         self._server_thread.join()
 
 
-
-def test_with_simple_server():
-    import sys
-    import os
-    if sys.version_info[0:2] < (3, 6):
-        # only works on Python 3.6 and newer
-        return
-
-    if os.environ.get('INAPPVEYOR', '') == '1':
-        # Appveyor does not allow server sockets even on localhost
-        return
-
-    import simple_server
+@pytest.fixture(scope='module')
+def certificate_key():
     import utils_35 as utils
-    import threading
     from cryptography import x509
-    address = ('127.0.0.1', 1433)
+    address = ('127.0.0.1', 1434)
     test_ca = utils.TestCA()
     server_key = test_ca.key('server')
     subject = x509.Name(
@@ -1084,32 +1116,68 @@ def test_with_simple_server():
     )
     builder = x509.CertificateBuilder()
     server_cert = test_ca.sign(name='server', cb=builder.subject_name(subject)
-        .not_valid_before(datetime.datetime.utcnow())
-        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
-        .serial_number(x509.random_serial_number())
-        .public_key(server_key.public_key()))
+                               .not_valid_before(datetime.datetime.utcnow())
+                               .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+                               .serial_number(1)
+                               .public_key(server_key.public_key()))
+    return server_cert, server_key
 
-    # make a certificate with incorrect host name in the subject
-    bad_server_cert = test_ca.sign(name='badname', cb=builder.subject_name(x509.Name([
-        x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, 'badname')]))
+
+@pytest.fixture
+def test_ca():
+    if sys.version_info[0:2] < (3, 6):
+        pytest.skip('only works on Python 3.6 and newer')
+    import utils_35 as utils
+    return utils.TestCA()
+
+
+@pytest.fixture
+def server_key(test_ca):
+    server_key = test_ca.key('server')
+    return server_key
+
+
+@pytest.fixture()
+def root_ca_path(test_ca):
+    return test_ca.cert_path('root')
+
+
+@pytest.fixture
+def address():
+    return ('127.0.0.1', 1434)
+
+@pytest.fixture
+def server_cert(server_key, address, test_ca):
+    from cryptography import x509
+    builder = x509.CertificateBuilder()
+    subject = x509.Name(
+        [x509.NameAttribute(
+            x509.oid.NameOID.COMMON_NAME, address[0]
+        )]
+    )
+    server_cert = test_ca.sign(name='server', cb=builder.subject_name(subject)
                                .not_valid_before(datetime.datetime.utcnow())
                                .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
                                .serial_number(x509.random_serial_number())
                                .public_key(server_key.public_key()))
+    return server_cert
 
-    # make certificate with matching SAN
-    server_cert_with_san = test_ca.sign(name='badname', cb=builder.subject_name(x509.Name([
-        x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, 'badname')]))
-                                   .not_valid_before(datetime.datetime.utcnow())
-                                   .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
-                                   .serial_number(x509.random_serial_number())
-                                   .public_key(server_key.public_key())
-                                   .add_extension(x509.SubjectAlternativeName([x509.DNSName(address[0])]), critical=False)
-                                   )
 
-    root_ca_path = test_ca.cert_path('root')
+def test_with_simple_server_req_encryption(server_cert, server_key, address, root_ca_path):
+    with SimpleServer(address=address, enc=PreLoginEnc.ENCRYPT_REQ, cert=server_cert, key=server_key):
+        with pytds.connect(
+                dsn=address[0],
+                port=address[1],
+                user="sa",
+                password='password',
+                disable_connect_retry=True,
+                autocommit=True,
+                cafile=root_ca_path):
+            pass
 
-    with TestServer(address=address, enc=PreLoginEnc.ENCRYPT_ON, cert=server_cert, key=server_key):
+
+def test_both_server_and_client_encryption_on(server_cert, server_key, address, root_ca_path):
+    with SimpleServer(address=address, enc=PreLoginEnc.ENCRYPT_ON, cert=server_cert, key=server_key):
         # test with both server and client configured for encryption
         with pytds.connect(
                 dsn=address[0],
@@ -1122,6 +1190,9 @@ def test_with_simple_server():
         ) as _:
             pass
 
+
+def test_server_has_enc_on_but_client_is_off(server_cert, server_key, address):
+    with SimpleServer(address=address, enc=PreLoginEnc.ENCRYPT_ON, cert=server_cert, key=server_key):
         # test with server having encrypt on but client has it off
         # should throw exception in this case
         with pytest.raises(pytds.Error) as excinfo:
@@ -1134,8 +1205,10 @@ def test_with_simple_server():
             )
         assert 'not have encryption enabled but it is required by server' in str(excinfo.value)
 
+
+def test_only_login_encrypted(server_cert, server_key, address, root_ca_path):
     # test login where only login is encrypted
-    with TestServer(address=address, enc=PreLoginEnc.ENCRYPT_OFF, cert=server_cert, key=server_key):
+    with SimpleServer(address=address, enc=PreLoginEnc.ENCRYPT_OFF, cert=server_cert, key=server_key):
         with pytds.connect(
                 dsn=address[0],
                 port=address[1],
@@ -1145,10 +1218,54 @@ def test_with_simple_server():
                 disable_connect_retry=True,
                 enc_login_only=True,
                 autocommit=True,
-        ) as conn:
+        ) as _:
             pass
 
-    with TestServer(address=address, enc=PreLoginEnc.ENCRYPT_OFF, cert=bad_server_cert, key=server_key):
+
+def test_server_encryption_not_supported(address, root_ca_path):
+    with SimpleServer(address=address, enc=PreLoginEnc.ENCRYPT_NOT_SUP):
+        with pytest.raises(pytds.Error) as excinfo:
+            with pytds.connect(
+                    dsn=address[0],
+                    port=address[1],
+                    user="sa",
+                    password='password',
+                    disable_connect_retry=True,
+                    autocommit=True,
+                    cafile=root_ca_path):
+                pass
+        assert 'You requested encryption but it is not supported by server' in str(excinfo.value)
+
+
+def test_client_use_old_tds_version(address):
+    with SimpleServer(address=address, tds_version=0):
+        with pytest.raises(ValueError) as excinfo:
+            with pytds.connect(
+                    dsn=address[0],
+                    port=address[1],
+                    user="sa",
+                    password='password',
+                    disable_connect_retry=True,
+                    autocommit=True,
+                    tds_version=0,
+                    ):
+                pass
+        assert 'This TDS version is not supported' in str(excinfo.value)
+
+
+def test_server_with_bad_name_in_cert(test_ca, server_key, address, root_ca_path):
+    from cryptography import x509
+    builder = x509.CertificateBuilder()
+
+    # make a certificate with incorrect host name in the subject
+    bad_server_cert = test_ca.sign(name='badname', cb=builder.subject_name(x509.Name([
+        x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, 'badname')]))
+                                   .not_valid_before(datetime.datetime.utcnow())
+                                   .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+                                   .serial_number(x509.random_serial_number())
+                                   .public_key(server_key.public_key()))
+
+    with SimpleServer(address=address, enc=PreLoginEnc.ENCRYPT_OFF, cert=bad_server_cert, key=server_key):
         with pytest.raises(pytds.Error) as excinfo:
             pytds.connect(
                 dsn=address[0],
@@ -1160,7 +1277,22 @@ def test_with_simple_server():
             )
         assert 'Certificate does not match host name' in str(excinfo.value)
 
-    with TestServer(address=address, enc=PreLoginEnc.ENCRYPT_ON, cert=server_cert_with_san, key=server_key):
+
+def test_cert_with_san(test_ca, server_key, address, root_ca_path):
+    from cryptography import x509
+    builder = x509.CertificateBuilder()
+
+    # make certificate with matching SAN
+    server_cert_with_san = test_ca.sign(name='badname', cb=builder.subject_name(x509.Name([
+        x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, 'badname')]))
+                                   .not_valid_before(datetime.datetime.utcnow())
+                                   .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+                                   .serial_number(x509.random_serial_number())
+                                   .public_key(server_key.public_key())
+                                   .add_extension(x509.SubjectAlternativeName([x509.DNSName(address[0])]), critical=False)
+                                   )
+
+    with SimpleServer(address=address, enc=PreLoginEnc.ENCRYPT_ON, cert=server_cert_with_san, key=server_key):
         with pytds.connect(
                 dsn=address[0],
                 port=address[1],
@@ -1189,3 +1321,74 @@ def test_ntlm():
 def test_parse_server():
     assert pytds._parse_server('.') == ('localhost', '')
     assert pytds._parse_server('(local)') == ('localhost', '')
+
+
+def tls_send_all(tls, transport, bufsize):
+    while True:
+        try:
+            buf = tls.bio_read(bufsize)
+        except OpenSSL.SSL.WantReadError:
+            break
+        else:
+            logger.info('sending %d bytes', len(buf))
+            transport.send(buf)
+
+
+def do_handshake(tls, transport, bufsize):
+    handshake_done = False
+    while not handshake_done:
+        try:
+            tls.do_handshake()
+        except OpenSSL.SSL.WantReadError:
+            # first send everything we have
+            tls_send_all(tls=tls, transport=transport, bufsize=bufsize)
+            # now receive one block
+            buf = transport.recv(bufsize)
+            logger.info('received %d bytes', len(buf))
+            tls.bio_write(buf)
+        else:
+            handshake_done = True
+    # send remaining data, if any
+    tls_send_all(tls=tls, transport=transport, bufsize=bufsize)
+
+
+@pytest.mark.skipif(sys.version_info[0:2] < (3, 5), reason='requires python 3.5 or newer')
+def test_encrypted_socket(certificate_key):
+    certificate, key = certificate_key
+    client, server = socket.socketpair()
+    bufsize = 512
+    client.settimeout(1)
+    server.settimeout(1)
+
+    ctx = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_2_METHOD)
+    ctx.set_options(OpenSSL.SSL.OP_NO_SSLv2)
+    ctx.set_options(OpenSSL.SSL.OP_NO_SSLv3)
+    ctx.use_certificate(OpenSSL.crypto.X509.from_cryptography(certificate))
+    ctx.use_privatekey(OpenSSL.crypto.PKey.from_cryptography_key(key))
+    serverconn = OpenSSL.SSL.Connection(ctx)
+    serverconn.set_accept_state()
+    clientconn = OpenSSL.SSL.Connection(ctx)
+    clientconn.set_connect_state()
+    def server_handler():
+        do_handshake(tls=serverconn, transport=server, bufsize=bufsize)
+        logger.info('handshake completed on server side')
+    server_thread = threading.Thread(
+        target=lambda: server_handler())
+    server_thread.start()
+    do_handshake(tls=clientconn, transport=client, bufsize=bufsize)
+    logger.info('handshake completed on client side')
+    #encclisocket = pytds.tls.EncryptedSocket(client, clientconn)
+
+
+def test_output_param_value_not_match_type():
+    with pytest.raises(ValueError) as ex:
+        pytds.output(param_type=int, value='hello')
+    assert 'value should match param_type, value is \'hello\', param_type is \'int\'' == str(ex.value)
+
+
+def test_tds_session_raise_db_exception():
+    tds = pytds.tds._TdsSocket()
+    sess = pytds.tds._TdsSession(tds=tds, transport=None, tzinfo_factory=None)
+    with pytest.raises(pytds.Error) as ex:
+        sess.raise_db_exception()
+    assert "Request failed, server didn't send error message" == str(ex.value)

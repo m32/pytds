@@ -1,6 +1,7 @@
 import socket
 import socketserver
 import struct
+import logging
 
 import OpenSSL.SSL
 
@@ -10,6 +11,7 @@ import pytds.tds
 _BYTE_STRUCT = struct.Struct('B')
 _OFF_LEN_STRUCT = struct.Struct('>HH')
 _PROD_VER_STRUCT = struct.Struct('>LH')
+logger = logging.getLogger(__name__)
 
 
 class TdsParser:
@@ -112,7 +114,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
                                                                             pytds.tds_base.PacketType.PRELOGIN)
             self.bad_stream(msg)
         prelogin = parser.parse_prelogin(buf)
-        print(f"received prelogin message from client {prelogin}")
+        logger.info(f"received prelogin message from client {prelogin}")
         srv_enc = self.server._enc
         cli_enc = prelogin[pytds.tds_base.PreLoginToken.ENCRYPTION]
         res_enc = None
@@ -140,6 +142,8 @@ class RequestHandler(socketserver.StreamRequestHandler):
                 close_conn = True
             elif cli_enc == pytds.PreLoginEnc.ENCRYPT_NOT_SUP:
                 res_enc = pytds.PreLoginEnc.ENCRYPT_NOT_SUP
+        elif srv_enc == pytds.PreLoginEnc.ENCRYPT_REQ:
+            res_enc = pytds.PreLoginEnc.ENCRYPT_REQ
 
         # sending reply to client's prelogin packet
         prelogin_resp = gen.generate_prelogin({
@@ -188,8 +192,12 @@ class RequestHandler(socketserver.StreamRequestHandler):
             r._transport = wrapped_socket
             w._transport = wrapped_socket
 
-        buf = r.read_whole_packet()
-        print(f"received login packet from client {buf}")
+        try:
+            buf = r.read_whole_packet()
+        except pytds.tds_base.ClosedConnectionError:
+            logger.info('client closed connection, probably did not like server certificate')
+            return
+        logger.info(f"received login packet from client {buf}")
 
         if res_enc == pytds.PreLoginEnc.ENCRYPT_OFF:
             wrapped_socket.shutdown()
@@ -198,7 +206,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
 
         srv_name = 'Simple TDS Server'
         srv_ver = (1, 0, 0, 0)
-        tds_version = pytds.tds_base.TDS74
+        tds_version = self.server._tds_version
 
         w.begin_packet(pytds.tds_base.PacketType.REPLY)
         # https://msdn.microsoft.com/en-us/library/dd340651.aspx
@@ -231,15 +239,18 @@ class RequestHandler(socketserver.StreamRequestHandler):
 class SimpleServer(socketserver.TCPServer):
     allow_reuse_address = True
 
-    def __init__(self, address, enc, cert=None, pkey=None):
+    def __init__(self, address, enc, cert=None, pkey=None, tds_version=pytds.tds_base.TDS74):
         self._enc = enc
         super().__init__(address, RequestHandler)
-        ctx = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_2_METHOD)
-        ctx.set_options(OpenSSL.SSL.OP_NO_SSLv2)
-        ctx.set_options(OpenSSL.SSL.OP_NO_SSLv3)
-        ctx.use_certificate(cert)
-        ctx.use_privatekey(pkey)
+        ctx = None
+        if cert and pkey:
+            ctx = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_2_METHOD)
+            ctx.set_options(OpenSSL.SSL.OP_NO_SSLv2)
+            ctx.set_options(OpenSSL.SSL.OP_NO_SSLv3)
+            ctx.use_certificate(cert)
+            ctx.use_privatekey(pkey)
         self._tls_ctx = ctx
+        self._tds_version = tds_version
 
     def set_ssl_context(self, ctx):
         self._tls_ctx = ctx
@@ -249,9 +260,9 @@ class SimpleServer(socketserver.TCPServer):
 
 
 def run(address):
-    print('Starting server...')
+    logger.info('Starting server...')
     with SimpleServer(address) as server:
-        print('Press Ctrl+C to stop the server')
+        logger.info('Press Ctrl+C to stop the server')
         server.serve_forever()
 
 
